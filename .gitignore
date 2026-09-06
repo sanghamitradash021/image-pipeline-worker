@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+jobs.db
+jobs.db-wal
+jobs.db-shm
+.venv/
+*.egg-info/
+.env
+.coverage
+htmlcov/
+.vscode/
+.idea/
+*.log
+.DS_Store
+
+# Sample images are regenerated locally (tools/generate_sample_images.py)
+# instead of being committed, to keep the repo small.
+sample_images/*
+!sample_images/.gitkeep

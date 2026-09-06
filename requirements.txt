@@ -1,0 +1,10 @@
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+sqlalchemy==1.4.31
+pydantic==2.11.7
+pydantic-settings==2.14.0
+opencv-python-headless
+numpy==2.2.6
+pytest
+httpx
+requests
