@@ -18,3 +18,5 @@ htmlcov/
 # instead of being committed, to keep the repo small.
 sample_images/*
 !sample_images/.gitkeep
+crash-recovery.png
+c83ab891-5d4f-4646-8971-584720a156ee.png
