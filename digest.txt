@@ -1,0 +1,1705 @@
+Directory structure:
+└── worker-job/
+    ├── README.md
+    ├── DESIGN.md
+    ├── pytest.ini
+    ├── requirements.txt
+    ├── stress_test.py
+    ├── .env.example
+    ├── app/
+    │   ├── __init__.py
+    │   ├── main.py
+    │   ├── worker.py
+    │   ├── api/
+    │   │   ├── __init__.py
+    │   │   └── routes/
+    │   │       ├── __init__.py
+    │   │       └── jobs.py
+    │   ├── core/
+    │   │   ├── __init__.py
+    │   │   └── config.py
+    │   ├── db/
+    │   │   ├── __init__.py
+    │   │   ├── models.py
+    │   │   └── session.py
+    │   ├── repositories/
+    │   │   ├── __init__.py
+    │   │   └── job_repository.py
+    │   ├── schemas/
+    │   │   ├── __init__.py
+    │   │   └── job.py
+    │   └── services/
+    │       ├── __init__.py
+    │       ├── blur_service.py
+    │       └── job_service.py
+    ├── tests/
+    │   ├── conftest.py
+    │   ├── test_api.py
+    │   ├── test_edge_cases.py
+    │   └── test_worker.py
+    ├── tools/
+    │   └── generate_sample_images.py
+    └── .claude/
+        └── settings.local.json
+
+================================================
+FILE: README.md
+================================================
+# Job Processing Service
+
+FastAPI + SQLite(/Postgres via SQLAlchemy) job queue with parallel worker
+processes, guaranteeing exactly-once processing. See `DESIGN.md` for how,
+and for the repository/service/controller layering.
+
+## Setup
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Configure where your images live — copy `.env.example` to `.env` and set
+`IMAGE_DIR`:
+
+```bash
+cp .env.example .env
+# edit .env, e.g.: IMAGE_DIR=/home/you/Pictures/test-images
+```
+
+Images are **not** committed to this repo (kept out via `.gitignore`) so it
+doesn't get bloated with binary files — `IMAGE_DIR` is the one thing you
+need to point at your own folder. `POST /jobs`' `image_path` is resolved
+relative to `IMAGE_DIR` (e.g. `"cat.jpg"` -> `$IMAGE_DIR/cat.jpg`); a path
+that escapes `IMAGE_DIR` (e.g. `"../../etc/passwd"`) is rejected with 400.
+
+For a quick try, or to run the tests/stress test, generate the bundled
+deterministic sample images locally (same output every run, nothing to
+commit). This one-off script uses Pillow, which isn't in `requirements.txt`
+(the app itself only needs OpenCV) — install it once if you need to run this:
+
+```bash
+pip install Pillow
+python tools/generate_sample_images.py   # writes into ./sample_images
+```
+
+If you leave `IMAGE_DIR` unset it defaults to `./sample_images`.
+
+## Run
+
+Start the API (creates `jobs.db` on first run):
+
+```bash
+uvicorn app.main:app --reload
+```
+
+In separate terminals, start 3 worker processes against the same DB and
+IMAGE_DIR:
+
+```bash
+python -m app.worker
+python -m app.worker
+python -m app.worker
+```
+
+(Or in the background: `python -m app.worker & python -m app.worker & python -m app.worker &`)
+
+## Try it
+
+```bash
+curl -X POST http://127.0.0.1:8000/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"image_path": "sharp_checkerboard.png"}'
+# => {"id": "...", "status": "pending", ...}
+
+curl http://127.0.0.1:8000/jobs/<id>
+
+curl "http://127.0.0.1:8000/jobs?status=done"
+```
+
+## Tests
+
+```bash
+pytest
+```
+
+Tests point `IMAGE_DIR` at the repo's `sample_images/` themselves (see
+`tests/conftest.py`) — generate that folder first if you haven't:
+`python tools/generate_sample_images.py`.
+
+## Stress test
+
+With the API and 3 workers already running (as above, same `IMAGE_DIR`):
+
+```bash
+python stress_test.py
+```
+
+Submits 100 jobs, polls up to 60s for all to finish, and asserts total
+count, deterministic `is_blurry`/`sharpness_score` per image, and
+`attempts == 1` for every job. Prints `PASS`/`FAIL`.
+
+## Project layout
+
+```
+app/
+  api/routes/jobs.py     controller: HTTP <-> service, request/response only
+  services/               business logic (job_service, blur_service)
+  repositories/           data access + the atomic queue-claim SQL
+  db/                      SQLAlchemy engine/session/models
+  core/config.py           env-var settings (DATABASE_URL, IMAGE_DIR)
+  main.py                  FastAPI app wiring
+  worker.py                worker CLI (python -m app.worker)
+```
+
+## Config (env vars / `.env`)
+
+- `DATABASE_URL` (default `sqlite:///./jobs.db`). Set to a Postgres URL
+  (e.g. `postgresql://user:pass@host/db`) to run against Postgres instead
+  — see the note in `DESIGN.md` about the claim query equivalent there
+  (`SELECT ... FOR UPDATE SKIP LOCKED`, not implemented in code; SQLite's
+  `UPDATE ... RETURNING` is used as shipped).
+- `IMAGE_DIR` (default `./sample_images`). Base directory `image_path`
+  values are resolved against.
+
+
+
+================================================
+FILE: DESIGN.md
+================================================
+# Design
+
+## Architecture
+
+```
+app/api/routes/jobs.py   controller: HTTP request/response only, no logic
+        |
+app/services/job_service.py    business logic (resolve image path, map to schema)
+app/services/blur_service.py   blur detection (Laplacian variance)
+        |
+app/repositories/job_repository.py   data access + the atomic queue-claim SQL
+        |
+app/db/ (session.py, models.py)      SQLAlchemy engine/session/Job model
+```
+
+```
+POST /jobs  ->  controller  ->  JobService.create_job  ->  JobRepository.create
+                                                     |
+                              SQLite/Postgres "jobs" table = the queue
+                                                     |
+        python -m app.worker  (N processes)  <------+
+              QueueRepository.claim_next_job (atomic UPDATE...RETURNING)
+              -> BlurService.compute_blur
+              -> QueueRepository.mark_done / mark_failed / mark_retry
+
+GET /jobs, /jobs/{id}  ->  controller -> JobService -> JobRepository (read)
+```
+
+There is no separate broker (Redis/RabbitMQ/etc). The `jobs` table *is* the
+queue: `status='pending'` rows are the backlog, and "dequeue" is an atomic
+claim UPDATE (`QueueRepository.claim_next_job`, in
+`app/repositories/job_repository.py`). This is the hinted approach in the
+assignment and needs zero extra infrastructure.
+
+`JobRepository` (session-based CRUD, used by the API) and `QueueRepository`
+(raw-connection atomic ops, used by the worker) are split because they need
+different transaction semantics: the API does ordinary ORM reads/writes,
+while the worker's claim/mark operations must each be one atomic SQL
+statement in one transaction — mixing them into a single ORM Session would
+make that atomicity accidental instead of explicit.
+
+## Exactly-once processing
+
+The core guarantee lives in one SQL statement, `CLAIM_SQL` in
+`app/repositories/job_repository.py`:
+
+```sql
+UPDATE jobs
+SET status = 'processing', attempts = attempts + 1, claimed_at = :now
+WHERE id = (
+    SELECT id FROM jobs
+    WHERE status = 'pending' AND (run_at IS NULL OR run_at <= :now)
+    ORDER BY created_at LIMIT 1
+)
+AND status = 'pending'
+RETURNING id, image_path, attempts
+```
+
+A worker never does a separate SELECT-then-UPDATE — that would leave a gap
+where two workers could both read the same pending row before either writes
+back. Instead the SELECT is a subquery *inside* the UPDATE's WHERE clause,
+and the trailing `AND status = 'pending'` is a repeated guard so the write
+only takes effect if the row is still pending at write time. All of this
+runs inside one transaction (`engine.begin()`), so it's atomic: either
+this worker fully claims the row and every other worker's UPDATE matches
+zero rows (`RETURNING` gives no row back, so the worker just sees "nothing
+to claim" and moves on), or it doesn't touch the row at all.
+
+SQLite makes this safe across separate *processes*, not just threads: only
+one write transaction can be active against the database file at a time —
+concurrent writers block on the file lock and retry (`PRAGMA busy_timeout`,
+set in `app/db/session.py`, controls how long they wait before erroring out) rather
+than interleaving. So the claim UPDATE from worker A and the claim UPDATE
+from worker B for the same row can never both partially apply; one commits
+first and the other's `WHERE status = 'pending'` then matches nothing.
+`PRAGMA journal_mode=WAL` is enabled so readers (the API's GET endpoints)
+aren't blocked while a worker holds a write transaction.
+
+If this were pointed at Postgres instead (`DATABASE_URL=postgresql://...`),
+the same guarantee is expressed as `SELECT id FROM jobs WHERE status =
+'pending' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED`, which is the
+standard pattern for a DB-table-backed queue there; Postgres's MVCC/row
+locks give the same "only one worker gets this row" property without
+SQLite's whole-file serialization. The current code targets SQLite per the
+assignment's hint and doesn't include the Postgres SQL variant.
+
+`attempts` is incremented as part of the same claim UPDATE, so it always
+reflects "how many times a worker has picked this job up," independent of
+whether processing then succeeds or fails. For a job that succeeds on its
+first pickup, `attempts == 1`, which is what the stress test asserts.
+
+## Bonus features implemented
+
+- **Retries with exponential backoff**: on failure, if `attempts <
+  MAX_ATTEMPTS` (3), the job goes back to `pending` with `run_at = now +
+  2^(attempts-1)` seconds and the error message recorded in `result`; once
+  `attempts` reaches 3 it's marked `failed` instead. (`app/worker.py`)
+- **Crash recovery**: before each claim attempt, a worker resets any job
+  that's been sitting in `processing` for more than `STUCK_TIMEOUT_SECONDS`
+  (60s) back to `pending`, so a worker that dies mid-job doesn't strand it
+  forever. (`QueueRepository.reclaim_stuck_jobs` in
+  `app/repositories/job_repository.py`, covered by
+  `tests/test_worker.py::test_reclaim_stuck_job_after_timeout`)
+
+  **Known limitation**: this treats "stuck in `processing` for
+  `STUCK_TIMEOUT_SECONDS`" as a proxy for "the worker crashed" — there's no
+  actual liveness check on the worker process. If a job's real processing
+  time ever exceeded 60s (blur detection normally doesn't), a second worker
+  could reclaim and reprocess a job the first worker is still legitimately
+  working on, breaking the exactly-once guarantee for that job (`attempts`
+  would end up `>1` even though nothing crashed). Mitigation would be a
+  heartbeat column the original worker refreshes while processing, with
+  `reclaim_stuck_jobs` checking that instead of a fixed wall-clock cutoff;
+  not implemented here since it's low-risk for this workload's processing
+  time, but worth flagging as a scaling/robustness follow-up.
+- **Scheduled jobs**: `POST /jobs` accepts an optional `run_at` timestamp;
+  the claim query only picks up rows where `run_at IS NULL OR run_at <=
+  now()`.
+
+## Keeping images out of the repo
+
+`IMAGE_DIR` (env var / `.env`, `app/core/config.py`) is the one thing each
+user configures locally. `POST /jobs`' `image_path` is resolved as
+`IMAGE_DIR / image_path` (`app/services/job_service.py:resolve_image_path`),
+which also rejects any path that escapes `IMAGE_DIR` (e.g. `../../etc/passwd`)
+with a 400 — a minimal traversal guard, not a full sandbox. This means the
+repo never needs to carry a user's actual image set; `sample_images/` is
+`.gitignore`d and regenerated on demand by
+`tools/generate_sample_images.py` for anyone who wants to run the tests or
+stress test without supplying their own images.
+
+## Assumptions
+
+- `image_path` is a path readable by the worker process (same filesystem,
+  or a shared volume in a multi-host deployment); no upload/storage layer
+  is in scope. It's resolved relative to `IMAGE_DIR`, not an absolute path
+  from the client — see "Keeping images out of the repo" above.
+- Blur threshold is `variance(Laplacian) < 100.0` → blurry. This is a
+  commonly-cited starting point for this metric on normal photographic
+  images; it isn't recalibrated per-image-size or per-domain. The bundled
+  `sample_images/` are synthetic (checkerboard/noise/stripe patterns, plus
+  their Gaussian-blurred versions) precisely so the sharp/blurry split and
+  exact variance are deterministic and don't depend on JPEG-compression or
+  camera-specific artifacts.
+- `python -m app.worker` polls with a 0.5s sleep when the queue is empty
+  rather than using a push/notify mechanism — simplest correct choice for
+  the stated scale (3 workers, 100 jobs), at the cost of up to 0.5s latency
+  before an idle worker picks up a freshly-enqueued job.
+- Single SQLite file (`jobs.db`) is assumed to live on local disk, not a
+  network filesystem (NFS) — SQLite's locking is unreliable there.
+- Pagination defaults: `page=1`, `page_size=20` (max 100) for `GET /jobs`.
+- Built and tested on Python 3.10 (the environment available at
+  implementation time) rather than 3.11+; nothing in the code is
+  3.11-specific.
+
+
+
+================================================
+FILE: pytest.ini
+================================================
+[pytest]
+pythonpath = .
+
+
+
+================================================
+FILE: requirements.txt
+================================================
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+sqlalchemy==1.4.31
+pydantic==2.11.7
+pydantic-settings==2.14.0
+opencv-python-headless
+numpy==2.2.6
+pytest
+httpx
+requests
+
+
+
+================================================
+FILE: stress_test.py
+================================================
+"""Standalone stress test.
+
+Assumes the API and 3 (or more) `python -m app.worker` processes are
+already running against the same DB and the same IMAGE_DIR (see
+README.md for exact commands).
+
+Submits 100 jobs (cycling through IMAGE_DIR's *.png files), polls until
+all are done/failed (60s timeout), and asserts:
+  - total jobs == 100
+  - each result matches the known-correct, deterministic value for its
+    input image (computed locally with the same code path the worker uses)
+  - attempts == 1 for every job (each job processed exactly once)
+
+Usage:
+    export IMAGE_DIR=./sample_images   # must match the API/workers' IMAGE_DIR
+    python -m app.worker &   # x3
+    uvicorn app.main:app &
+    python stress_test.py
+"""
+
+import glob
+import os
+import sys
+import time
+
+import requests
+
+API_URL = os.environ.get("API_URL", "http://127.0.0.1:8000")
+NUM_JOBS = 100
+POLL_INTERVAL_SECONDS = 1
+TIMEOUT_SECONDS = 60
+
+
+def load_expected_results():
+    """Compute ground truth locally with the same code path the worker
+    uses, so this script has no hardcoded numbers to drift out of sync.
+
+    Must run with the same IMAGE_DIR env var as the API/workers, so the
+    filenames submitted here resolve to the same files on both sides.
+    """
+    from app.core.config import get_settings
+    from app.services.blur_service import compute_blur
+
+    image_dir = get_settings().image_dir
+    extensions = ("*.png", "*.jpg", "*.jpeg", "*.bmp")
+    paths = sorted(
+        p for ext in extensions for p in glob.glob(os.path.join(image_dir, ext))
+    )
+    if not paths:
+        print(f"FAIL: no images ({', '.join(extensions)}) found in IMAGE_DIR={image_dir}")
+        sys.exit(1)
+
+    filenames = [os.path.basename(p) for p in paths]
+    expected = {name: compute_blur(path) for name, path in zip(filenames, paths)}
+    return filenames, expected
+
+
+def submit_jobs(filenames):
+    job_ids = []
+    for i in range(NUM_JOBS):
+        filename = filenames[i % len(filenames)]
+        resp = requests.post(f"{API_URL}/jobs", json={"image_path": filename})
+        resp.raise_for_status()
+        body = resp.json()
+        job_ids.append((body["id"], filename))
+    return job_ids
+
+
+def poll_until_terminal(job_ids):
+    remaining = {job_id for job_id, _ in job_ids}
+    finished = {}
+    deadline = time.time() + TIMEOUT_SECONDS
+
+    while remaining and time.time() < deadline:
+        for job_id in list(remaining):
+            resp = requests.get(f"{API_URL}/jobs/{job_id}")
+            resp.raise_for_status()
+            body = resp.json()
+            if body["status"] in ("done", "failed"):
+                finished[job_id] = body
+                remaining.discard(job_id)
+        if remaining:
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+    return finished, remaining
+
+
+def print_report(job_ids, finished, remaining, elapsed_seconds):
+    total = len(job_ids)
+    done = sum(1 for b in finished.values() if b["status"] == "done")
+    failed = sum(1 for b in finished.values() if b["status"] == "failed")
+    blurry = sum(1 for b in finished.values() if b["status"] == "done" and (b.get("result") or {}).get("is_blurry"))
+    sharp = sum(1 for b in finished.values() if b["status"] == "done" and (b.get("result") or {}).get("is_blurry") is False)
+    attempts_list = [b["attempts"] for b in finished.values()]
+    retried = sum(1 for a in attempts_list if a > 1)
+    throughput = total / elapsed_seconds if elapsed_seconds > 0 else 0.0
+
+    print()
+    print("=" * 60)
+    print("STRESS TEST REPORT")
+    print("=" * 60)
+    print(f"{'Total jobs submitted':<30}{total}")
+    print(f"{'Finished (done + failed)':<30}{len(finished)}")
+    print(f"{'Still pending/processing':<30}{len(remaining)}")
+    print(f"{'  done':<30}{done}")
+    print(f"{'  failed':<30}{failed}")
+    print(f"{'  sharp (is_blurry=false)':<30}{sharp}")
+    print(f"{'  blurry (is_blurry=true)':<30}{blurry}")
+    print(f"{'Jobs needing a retry (>1)':<30}{retried}")
+    print(f"{'Elapsed time':<30}{elapsed_seconds:.2f}s")
+    print(f"{'Throughput':<30}{throughput:.2f} jobs/sec")
+    print("=" * 60)
+
+
+def main():
+    filenames, expected = load_expected_results()
+    print(f"Submitting {NUM_JOBS} jobs against {API_URL} using {len(filenames)} sample images...")
+
+    start = time.time()
+    job_ids = submit_jobs(filenames)
+    finished, remaining = poll_until_terminal(job_ids)
+    elapsed = time.time() - start
+
+    print_report(job_ids, finished, remaining, elapsed)
+
+    failures = []
+
+    if len(job_ids) != NUM_JOBS:
+        failures.append(f"expected {NUM_JOBS} submitted jobs, got {len(job_ids)}")
+
+    if remaining:
+        failures.append(f"{len(remaining)} jobs did not finish within {TIMEOUT_SECONDS}s")
+
+    for job_id, filename in job_ids:
+        body = finished.get(job_id)
+        if body is None:
+            continue  # already reported above as a timeout
+
+        if body["status"] != "done":
+            failures.append(f"job {job_id} ({filename}) status={body['status']}, expected done")
+            continue
+
+        want = expected[filename]
+        got = body["result"] or {}
+        if got.get("is_blurry") != want["is_blurry"]:
+            failures.append(
+                f"job {job_id} ({filename}) is_blurry={got.get('is_blurry')}, "
+                f"expected {want['is_blurry']}"
+            )
+        if got.get("sharpness_score") != want["sharpness_score"]:
+            failures.append(
+                f"job {job_id} ({filename}) sharpness_score={got.get('sharpness_score')}, "
+                f"expected {want['sharpness_score']}"
+            )
+        if body["attempts"] != 1:
+            failures.append(
+                f"job {job_id} ({filename}) attempts={body['attempts']}, expected 1"
+            )
+
+    print()
+    if failures:
+        print(f"FAIL: {len(failures)} problem(s) found")
+        for f in failures[:50]:
+            print(f"  - {f}")
+        sys.exit(1)
+    else:
+        print(f"PASS: all {NUM_JOBS} jobs processed exactly once with correct, deterministic results")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+================================================
+FILE: .env.example
+================================================
+DATABASE_URL=sqlite:///./jobs.db
+
+# Directory where your images actually live. image_path in POST /jobs is
+# resolved relative to this, so images are never committed to the repo.
+# Copy this file to .env and point it wherever you like, e.g.:
+#   IMAGE_DIR=/home/you/Pictures/test-images
+# IMAGE_DIR=./sample_images
+IMAGE_DIR=/home/sanghamitrad/Documents/Assignments/python/images
+
+
+================================================
+FILE: app/__init__.py
+================================================
+
+
+
+================================================
+FILE: app/main.py
+================================================
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from app.api.routes.jobs import router as jobs_router
+from app.db.session import init_db
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(title="Job Processing Service", lifespan=lifespan)
+app.include_router(jobs_router)
+
+
+
+================================================
+FILE: app/worker.py
+================================================
+"""Worker process: `python -m app.worker [--once]`.
+
+Loops forever, claiming one job at a time via QueueRepository.claim_next_job
+and processing it. Safe to run many copies of this process at once against
+the same DB file (see app/repositories/job_repository.py and DESIGN.md).
+"""
+
+import argparse
+import json
+import logging
+import os
+import time
+from datetime import datetime, timedelta, timezone
+
+from app.db.session import engine, init_db
+from app.repositories.job_repository import QueueRepository
+from app.services.blur_service import compute_blur
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [worker] %(message)s")
+log = logging.getLogger("worker")
+
+MAX_ATTEMPTS = 3  # bonus: retries with exponential backoff
+BACKOFF_BASE_SECONDS = 2
+STUCK_TIMEOUT_SECONDS = 60  # bonus: crash recovery for stuck 'processing' jobs
+POLL_INTERVAL_SECONDS = 0.5
+
+
+def process_once() -> bool:
+    """Claim and process a single job. Returns False if no job was pending."""
+    with engine.begin() as conn:
+        QueueRepository.reclaim_stuck_jobs(
+            conn, cutoff=datetime.now(timezone.utc) - timedelta(seconds=STUCK_TIMEOUT_SECONDS)
+        )
+        row = QueueRepository.claim_next_job(conn)
+        if row is None:
+            return False
+        job_id, image_path, attempts = row.id, row.image_path, row.attempts
+
+    try:
+        result = compute_blur(image_path)
+        with engine.begin() as conn:
+            QueueRepository.mark_done(conn, job_id, json.dumps(result))
+        log.info("job %s done: %s", job_id, result)
+    except Exception as exc:  # noqa: BLE001 - any processing failure marks the job failed
+        error_result = json.dumps({"error": str(exc)})
+        with engine.begin() as conn:
+            if attempts < MAX_ATTEMPTS:
+                backoff = BACKOFF_BASE_SECONDS * (2 ** (attempts - 1))
+                run_at = datetime.now(timezone.utc) + timedelta(seconds=backoff)
+                QueueRepository.mark_retry(conn, job_id, error_result, run_at)
+                log.warning(
+                    "job %s failed (attempt %d/%d), retrying in %ss: %s",
+                    job_id, attempts, MAX_ATTEMPTS, backoff, exc,
+                )
+            else:
+                QueueRepository.mark_failed(conn, job_id, error_result)
+                log.error("job %s failed permanently after %d attempts: %s", job_id, attempts, exc)
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Job processing worker")
+    parser.add_argument("--once", action="store_true", help="process a single job and exit")
+    args = parser.parse_args()
+
+    init_db()
+    log.info("worker started (pid=%s)", os.getpid())
+
+    if args.once:
+        process_once()
+        return
+
+    while True:
+        if not process_once():
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+================================================
+FILE: app/api/__init__.py
+================================================
+
+
+
+================================================
+FILE: app/api/routes/__init__.py
+================================================
+
+
+
+================================================
+FILE: app/api/routes/jobs.py
+================================================
+from typing import Generator, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
+
+from app.db.session import SessionLocal
+from app.repositories.job_repository import JobRepository
+from app.schemas.job import JobCreate, JobList, JobOut
+from app.services.job_service import JobService
+
+router = APIRouter(prefix="/jobs", tags=["jobs"])
+
+
+def get_db() -> Generator[Session, None, None]:
+    session = SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+def get_job_service(session: Session = Depends(get_db)) -> JobService:
+    return JobService(JobRepository(session))
+
+
+@router.post("", response_model=JobOut, status_code=201)
+def create_job(payload: JobCreate, service: JobService = Depends(get_job_service)):
+    try:
+        return service.create_job(payload.image_path, payload.run_at)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/{job_id}", response_model=JobOut)
+def get_job(job_id: str, service: JobService = Depends(get_job_service)):
+    job = service.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
+
+
+@router.get("", response_model=JobList)
+def list_jobs(
+    status: Optional[str] = Query(default=None, pattern="^(pending|processing|done|failed)$"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    service: JobService = Depends(get_job_service),
+):
+    return service.list_jobs(status, page, page_size)
+
+
+
+================================================
+FILE: app/core/__init__.py
+================================================
+
+
+
+================================================
+FILE: app/core/config.py
+================================================
+from functools import lru_cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """All config comes from env vars (or a .env file). Nothing here is
+    hardcoded so the same code runs against any user's local image
+    folder / DB without editing source."""
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    database_url: str = "sqlite:///./jobs.db"
+
+    # Directory the user's images actually live in. image_path in job
+    # requests is resolved relative to this, so images never need to be
+    # committed to the repo (see IMAGE_DIR in README.md / .env.example).
+    image_dir: str = "./sample_images"
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+
+
+================================================
+FILE: app/db/__init__.py
+================================================
+
+
+
+================================================
+FILE: app/db/models.py
+================================================
+import uuid
+from datetime import datetime, timezone
+
+from sqlalchemy import Column, DateTime, Integer, String, Text
+
+from app.db.session import Base
+
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def _new_id():
+    return uuid.uuid4().hex
+
+
+class Job(Base):
+    __tablename__ = "jobs"
+
+    id = Column(String, primary_key=True, default=_new_id)
+    image_path = Column(String, nullable=False)  # resolved against settings.image_dir
+    status = Column(String, nullable=False, default="pending", index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    result = Column(Text, nullable=True)  # JSON-encoded dict
+    run_at = Column(DateTime(timezone=True), nullable=True)
+    claimed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_now, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now, nullable=False)
+
+
+
+================================================
+FILE: app/db/session.py
+================================================
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+from app.core.config import get_settings
+
+Base = declarative_base()
+
+
+def _build_engine():
+    database_url = get_settings().database_url
+    connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
+    engine = create_engine(database_url, connect_args=connect_args, future=True)
+
+    if database_url.startswith("sqlite"):
+        @event.listens_for(engine, "connect")
+        def _set_sqlite_pragma(dbapi_conn, _record):
+            cursor = dbapi_conn.cursor()
+            # WAL lets readers and one writer proceed concurrently; busy_timeout
+            # makes concurrent writers block-and-retry instead of raising
+            # "database is locked" when several worker processes write at once.
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=10000")
+            cursor.close()
+
+    return engine
+
+
+engine = _build_engine()
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+
+def init_db():
+    from app.db import models  # noqa: F401  (register models on Base before create_all)
+    Base.metadata.create_all(bind=engine)  # type: ignore[attr-defined]
+
+
+
+================================================
+FILE: app/repositories/__init__.py
+================================================
+
+
+
+================================================
+FILE: app/repositories/job_repository.py
+================================================
+"""Data access layer for jobs. This is also where the queue lives: the
+`jobs` table's `status='pending'` rows are the queue, and claiming a row
+is a single atomic UPDATE...RETURNING statement.
+
+Why this is safe with N worker processes hitting the same SQLite file:
+SQLite only ever allows one writer transaction to be mid-flight at a time
+(others block on the file lock, up to PRAGMA busy_timeout, then retry).
+CLAIM_SQL both selects and flips status in one statement, inside one
+transaction, so there is no gap between "read pending row" and "mark it
+processing" for a second worker to race into. See DESIGN.md for the full
+exactly-once argument, and for the Postgres equivalent
+(`SELECT ... FOR UPDATE SKIP LOCKED`).
+"""
+
+from datetime import datetime, timezone
+from typing import Optional
+
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from app.db.models import Job
+
+CLAIM_SQL = text(
+    """
+    UPDATE jobs
+    SET status = 'processing',
+        attempts = attempts + 1,
+        claimed_at = :now
+    WHERE id = (
+        SELECT id FROM jobs
+        WHERE status = 'pending'
+          AND (run_at IS NULL OR run_at <= :now)
+        ORDER BY created_at
+        LIMIT 1
+    )
+    AND status = 'pending'
+    RETURNING id, image_path, attempts
+    """
+)
+
+RECLAIM_STUCK_SQL = text(
+    """
+    UPDATE jobs
+    SET status = 'pending'
+    WHERE status = 'processing'
+      AND claimed_at < :cutoff
+    """
+)
+
+MARK_DONE_SQL = text(
+    "UPDATE jobs SET status = 'done', result = :result, updated_at = :now WHERE id = :id"
+)
+MARK_FAILED_SQL = text(
+    "UPDATE jobs SET status = 'failed', result = :result, updated_at = :now WHERE id = :id"
+)
+MARK_RETRY_SQL = text(
+    "UPDATE jobs SET status = 'pending', result = :result, run_at = :run_at, "
+    "updated_at = :now WHERE id = :id"
+)
+
+
+class JobRepository:
+    """CRUD for the API layer, backed by an ORM Session."""
+
+    def __init__(self, session: Session):
+        self.session = session
+
+    def create(self, image_path: str, run_at: Optional[datetime] = None) -> Job:
+        job = Job(image_path=image_path, status="pending", run_at=run_at)  # type: ignore[call-arg]
+        self.session.add(job)
+        self.session.commit()
+        self.session.refresh(job)
+        return job
+
+    def get_by_id(self, job_id: str) -> Optional[Job]:
+        return self.session.get(Job, job_id)  # type: ignore[return-value]
+
+    def list(self, status: Optional[str], page: int, page_size: int) -> tuple[int, list[Job]]:
+        query = self.session.query(Job)  # type: ignore[var-annotated]
+        if status:
+            query = query.filter(Job.status == status)  # type: ignore[var-annotated]
+        total = query.count()
+        items = (
+            query.order_by(Job.created_at)  # type: ignore[var-annotated]
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
+        return total, items
+
+
+class QueueRepository:
+    """Queue operations for the worker, backed by a raw Connection so each
+    call can run as one atomic transaction (see module docstring)."""
+
+    @staticmethod
+    def claim_next_job(conn):
+        now = datetime.now(timezone.utc)
+        return conn.execute(CLAIM_SQL, {"now": now}).first()
+
+    @staticmethod
+    def reclaim_stuck_jobs(conn, cutoff: datetime) -> None:
+        conn.execute(RECLAIM_STUCK_SQL, {"cutoff": cutoff})
+
+    @staticmethod
+    def mark_done(conn, job_id: str, result_json: str) -> None:
+        now = datetime.now(timezone.utc)
+        conn.execute(MARK_DONE_SQL, {"result": result_json, "now": now, "id": job_id})
+
+    @staticmethod
+    def mark_failed(conn, job_id: str, result_json: str) -> None:
+        now = datetime.now(timezone.utc)
+        conn.execute(MARK_FAILED_SQL, {"result": result_json, "now": now, "id": job_id})
+
+    @staticmethod
+    def mark_retry(conn, job_id: str, result_json: str, run_at: datetime) -> None:
+        now = datetime.now(timezone.utc)
+        conn.execute(
+            MARK_RETRY_SQL,
+            {"result": result_json, "run_at": run_at, "now": now, "id": job_id},
+        )
+
+
+
+================================================
+FILE: app/schemas/__init__.py
+================================================
+
+
+
+================================================
+FILE: app/schemas/job.py
+================================================
+from datetime import datetime
+from typing import Any, List, Optional
+
+from pydantic import BaseModel, ConfigDict
+
+
+class JobCreate(BaseModel):
+    image_path: str  # resolved relative to IMAGE_DIR, see app/services/job_service.py
+    run_at: Optional[datetime] = None  # bonus: schedule a job for the future
+
+
+class JobOut(BaseModel):
+    id: str
+    status: str
+    result: Optional[Any] = None
+    attempts: int
+    created_at: datetime
+    updated_at: datetime
+    claimed_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class JobList(BaseModel):
+    total: int
+    items: List[JobOut]
+
+
+
+================================================
+FILE: app/services/__init__.py
+================================================
+
+
+
+================================================
+FILE: app/services/blur_service.py
+================================================
+import cv2
+
+# Variance of the Laplacian below this value is classified as "blurry".
+# Chosen empirically for typical photo-sized images (see DESIGN.md).
+BLUR_THRESHOLD = 100.0
+
+
+def compute_blur(image_path: str) -> dict:
+    """Read image_path as grayscale and score its sharpness.
+
+    Raises FileNotFoundError for OpenCV's failure-to-decode case
+    (cv2.imread returns None instead of raising), which the worker turns
+    into a failed/retried job.
+    """
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)  # pylint: disable=no-member
+    if img is None:
+        raise FileNotFoundError(f"cannot read image: {image_path}")
+
+    variance = cv2.Laplacian(img, cv2.CV_64F).var()  # pylint: disable=no-member
+    is_blurry = variance < BLUR_THRESHOLD
+    return {"is_blurry": bool(is_blurry), "sharpness_score": round(float(variance), 4)}
+
+
+
+================================================
+FILE: app/services/job_service.py
+================================================
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from app.core.config import get_settings
+from app.db.models import Job
+from app.repositories.job_repository import JobRepository
+from app.schemas.job import JobList, JobOut
+
+
+def resolve_image_path(image_path: str) -> str:
+    """Resolve a user-supplied image_path against IMAGE_DIR and reject
+    anything that escapes it (e.g. "../../etc/passwd").
+
+    Images are never committed to the repo — each user points IMAGE_DIR at
+    wherever their own images live (see .env.example / README.md) and
+    requests reference files by name/relative-path within it.
+    """
+    image_dir = Path(get_settings().image_dir).resolve()
+    candidate = (image_dir / image_path).resolve()
+    if candidate != image_dir and image_dir not in candidate.parents:
+        raise ValueError(f"image_path escapes IMAGE_DIR: {image_path}")
+    return str(candidate)
+
+
+class JobService:
+    def __init__(self, repository: JobRepository):
+        self.repository = repository
+
+    def create_job(self, image_path: str, run_at: Optional[datetime]) -> JobOut:
+        resolved_path = resolve_image_path(image_path)
+        job = self.repository.create(image_path=resolved_path, run_at=run_at)
+        return self._to_schema(job)
+
+    def get_job(self, job_id: str) -> Optional[JobOut]:
+        job = self.repository.get_by_id(job_id)
+        return self._to_schema(job) if job else None
+
+    def list_jobs(self, status: Optional[str], page: int, page_size: int) -> JobList:
+        total, items = self.repository.list(status, page, page_size)
+        return JobList(total=total, items=[self._to_schema(j) for j in items])
+
+    @staticmethod
+    def _to_schema(job: Job) -> JobOut:
+        result = json.loads(job.result) if job.result else None
+        return JobOut(
+            id=job.id,
+            status=job.status,
+            result=result,
+            attempts=job.attempts,
+            created_at=job.created_at,
+            updated_at=job.updated_at,
+            claimed_at=job.claimed_at,
+        )
+
+
+
+================================================
+FILE: tests/conftest.py
+================================================
+import importlib
+import os
+
+import pytest
+from fastapi.testclient import TestClient
+
+SAMPLE_IMAGE_DIR = os.path.join(os.path.dirname(__file__), "..", "sample_images")
+
+
+@pytest.fixture
+def app_env(tmp_path):
+    """Point the app at a fresh, isolated SQLite file (and the repo's
+    sample_images/ as IMAGE_DIR) for this test, and reload every app
+    module that cached settings/engine at import time."""
+    db_path = tmp_path / "test_jobs.db"
+    os.environ["DATABASE_URL"] = f"sqlite:///{db_path}"
+    os.environ["IMAGE_DIR"] = SAMPLE_IMAGE_DIR
+
+    import app.core.config as config
+    import app.db.session as session
+    import app.db.models as models
+    import app.repositories.job_repository as job_repository
+    import app.services.blur_service as blur_service
+    import app.services.job_service as job_service
+    import app.api.routes.jobs as jobs_routes
+    import app.worker as worker
+    import app.main as main
+
+    config.get_settings.cache_clear()
+    for module in (
+        config, session, models, job_repository, blur_service,
+        job_service, jobs_routes, worker, main,
+    ):
+        importlib.reload(module)
+
+    session.init_db()
+
+    yield main, worker
+
+    del os.environ["DATABASE_URL"]
+    del os.environ["IMAGE_DIR"]
+
+
+@pytest.fixture
+def client(app_env):
+    main, _worker = app_env
+    return TestClient(main.app)
+
+
+
+================================================
+FILE: tests/test_api.py
+================================================
+SAMPLE = "sharp_checkerboard.png"  # resolved against IMAGE_DIR (see conftest.py)
+
+
+def test_create_job(client):
+    resp = client.post("/jobs", json={"image_path": SAMPLE})
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["status"] == "pending"
+    assert body["attempts"] == 0
+    assert body["result"] is None
+    assert "id" in body and body["id"]
+
+
+def test_get_job(client):
+    created = client.post("/jobs", json={"image_path": SAMPLE}).json()
+    resp = client.get(f"/jobs/{created['id']}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == created["id"]
+    assert body["status"] == "pending"
+    assert "created_at" in body and "updated_at" in body
+
+
+def test_get_job_not_found(client):
+    resp = client.get("/jobs/does-not-exist")
+    assert resp.status_code == 404
+
+
+def test_create_job_rejects_path_escaping_image_dir(client):
+    resp = client.post("/jobs", json={"image_path": "../../etc/passwd"})
+    assert resp.status_code == 400
+
+
+def test_list_jobs_with_status_filter(client):
+    client.post("/jobs", json={"image_path": SAMPLE})
+    client.post("/jobs", json={"image_path": SAMPLE})
+
+    resp = client.get("/jobs", params={"status": "pending"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 2
+    assert all(item["status"] == "pending" for item in body["items"])
+
+    resp = client.get("/jobs", params={"status": "done"})
+    assert resp.json()["total"] == 0
+
+
+
+================================================
+FILE: tests/test_edge_cases.py
+================================================
+"""Negative / edge-case test suite.
+
+Complements the happy-path coverage in test_api.py and test_worker.py.
+Each section below maps to one item of the edge-case checklist this suite
+was written against (numbers kept in the comments for traceability).
+"""
+
+import os
+import shutil
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from sqlalchemy import text
+
+SAMPLE = "sharp_checkerboard.png"
+
+
+# 1. Invalid/missing image_path ---------------------------------------------
+
+def test_missing_image_path_rejected(client):
+    resp = client.post("/jobs", json={})
+    assert resp.status_code == 422
+
+
+def test_null_image_path_rejected(client):
+    resp = client.post("/jobs", json={"image_path": None})
+    assert resp.status_code == 422
+
+
+def test_empty_image_path_accepted_but_fails_at_processing(client, app_env):
+    """Empty string resolves to IMAGE_DIR itself (not outside it, so the
+    traversal guard doesn't reject it) but isn't a readable image, so the
+    worker fails it rather than the API rejecting it up front."""
+    _main, worker = app_env
+    created = client.post("/jobs", json={"image_path": ""}).json()
+    assert created["status"] == "pending"
+
+    worker.process_once()
+    job = client.get(f"/jobs/{created['id']}").json()
+    assert job["status"] in ("pending", "failed")
+    assert job["result"] is not None and "error" in job["result"]
+
+
+# 2. Non-existent image ------------------------------------------------------
+
+def test_nonexistent_image_fails_gracefully(client, app_env):
+    _main, worker = app_env
+    created = client.post("/jobs", json={"image_path": "no_such_file.png"}).json()
+
+    worker.process_once()
+
+    job = client.get(f"/jobs/{created['id']}").json()
+    assert job["attempts"] == 1
+    assert job["status"] == "pending"  # first failure -> retried, not failed yet
+    assert "error" in job["result"]
+
+
+# 3. Unsupported/corrupted image ---------------------------------------------
+
+def test_corrupted_image_fails_gracefully(client, app_env):
+    from app.core.config import get_settings
+
+    image_dir = get_settings().image_dir
+    corrupt_path = os.path.join(image_dir, "corrupt.png")
+    with open(corrupt_path, "wb") as f:
+        f.write(b"not a real image, just garbage bytes")
+
+    try:
+        created = client.post("/jobs", json={"image_path": "corrupt.png"}).json()
+        _main, worker = app_env
+        worker.process_once()
+
+        job = client.get(f"/jobs/{created['id']}").json()
+        assert job["status"] in ("pending", "failed")
+        assert "error" in job["result"]
+    finally:
+        os.remove(corrupt_path)
+
+
+# 4. Non-existent job ID ------------------------------------------------------
+
+def test_get_nonexistent_job_returns_404(client):
+    resp = client.get("/jobs/00000000-0000-0000-0000-000000000000")
+    assert resp.status_code == 404
+
+
+# 5. Worker failure (any exception, not just a missing file) -----------------
+
+def test_worker_handles_unexpected_exception_without_crashing(client, app_env, monkeypatch):
+    _main, worker = app_env
+    created = client.post("/jobs", json={"image_path": SAMPLE}).json()
+
+    def boom(_path):
+        raise RuntimeError("simulated unexpected failure")
+
+    monkeypatch.setattr(worker, "compute_blur", boom)
+    did_work = worker.process_once()
+
+    assert did_work is True  # the worker loop itself must not crash/raise
+    job = client.get(f"/jobs/{created['id']}").json()
+    assert job["result"]["error"] == "simulated unexpected failure"
+    assert job["status"] == "pending"  # attempt 1 of 3 -> retried
+
+
+# 6. Worker crash during processing (simulated) ------------------------------
+
+def test_worker_crash_leaves_job_processing_until_reclaimed(client, app_env):
+    from app.repositories.job_repository import QueueRepository
+
+    _main, worker = app_env
+    created = client.post("/jobs", json={"image_path": SAMPLE}).json()
+
+    # Simulate a worker that claims the job then crashes before it can mark
+    # done/failed: run only the claim step, skip the rest of process_once.
+    with worker.engine.begin() as conn:
+        row = QueueRepository.claim_next_job(conn)
+    assert row is not None and row.id == created["id"]
+
+    job = client.get(f"/jobs/{created['id']}").json()
+    assert job["status"] == "processing"  # orphaned by the "crashed" worker
+
+    # Not past STUCK_TIMEOUT_SECONDS yet -> a healthy worker leaves it alone.
+    assert worker.process_once() is False
+
+    # Once the stuck window elapses, it gets reclaimed and finished normally.
+    with worker.engine.begin() as conn:
+        conn.execute(
+            text("UPDATE jobs SET claimed_at = :claimed_at WHERE id = :id"),
+            {
+                "claimed_at": datetime.now(timezone.utc)
+                - timedelta(seconds=worker.STUCK_TIMEOUT_SECONDS + 5),
+                "id": created["id"],
+            },
+        )
+    assert worker.process_once() is True
+    job = client.get(f"/jobs/{created['id']}").json()
+    assert job["status"] == "done"
+
+
+# 7. Multiple workers claiming the same job ----------------------------------
+
+def test_only_one_worker_claims_a_given_job(client, app_env):
+    from app.repositories.job_repository import QueueRepository
+
+    _main, worker = app_env
+    created = client.post("/jobs", json={"image_path": SAMPLE}).json()
+
+    results = []
+
+    def try_claim():
+        with worker.engine.begin() as conn:
+            results.append(QueueRepository.claim_next_job(conn))
+
+    threads = [threading.Thread(target=try_claim) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    claimed = [r for r in results if r is not None]
+    assert len(claimed) == 1
+    assert claimed[0].id == created["id"]
+
+    job = client.get(f"/jobs/{created['id']}").json()
+    assert job["attempts"] == 1  # claimed exactly once despite 5 concurrent attempts
+
+
+# 8. Retry + max-retry behavior -----------------------------------------------
+
+def test_retry_uses_real_backoff_before_becoming_eligible_again(client, app_env):
+    _main, worker = app_env
+    created = client.post("/jobs", json={"image_path": "no_such_file.png"}).json()
+
+    worker.process_once()
+    job = client.get(f"/jobs/{created['id']}").json()
+    assert job["status"] == "pending"
+    assert job["attempts"] == 1
+
+    # Real (non-zero) backoff pushed run_at into the future -> not yet
+    # eligible for reclaim, so nothing gets claimed on an immediate retry.
+    assert worker.process_once() is False
+
+
+def test_retry_fails_permanently_after_max_attempts(client, app_env, monkeypatch):
+    _main, worker = app_env
+    monkeypatch.setattr(worker, "BACKOFF_BASE_SECONDS", 0)  # zero backoff for all attempts below
+
+    created = client.post("/jobs", json={"image_path": "no_such_file.png"}).json()
+
+    for _ in range(worker.MAX_ATTEMPTS):
+        worker.process_once()
+
+    job = client.get(f"/jobs/{created['id']}").json()
+    assert job["status"] == "failed"
+    assert job["attempts"] == worker.MAX_ATTEMPTS
+
+
+# 9. Job stuck in processing (left alone below the stuck-timeout threshold) --
+
+def test_job_processing_not_reclaimed_before_stuck_timeout(client, app_env):
+    from app.repositories.job_repository import QueueRepository
+
+    _main, worker = app_env
+    created = client.post("/jobs", json={"image_path": SAMPLE}).json()
+
+    with worker.engine.begin() as conn:
+        QueueRepository.claim_next_job(conn)
+
+    # claimed_at is "now" from the claim above -> well within the stuck
+    # window, so an explicit reclaim pass must not touch it.
+    with worker.engine.begin() as conn:
+        QueueRepository.reclaim_stuck_jobs(
+            conn,
+            cutoff=datetime.now(timezone.utc) - timedelta(seconds=worker.STUCK_TIMEOUT_SECONDS),
+        )
+
+    job = client.get(f"/jobs/{created['id']}").json()
+    assert job["status"] == "processing"
+
+
+# 10. Database concurrency/locking -------------------------------------------
+
+def test_concurrent_job_creation_does_not_deadlock_or_corrupt(client, app_env):
+    from app.db.session import SessionLocal
+    from app.repositories.job_repository import JobRepository
+
+    errors = []
+
+    def create_one():
+        try:
+            session = SessionLocal()
+            JobRepository(session).create(image_path=SAMPLE)
+            session.close()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=create_one) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent writes raised: {errors}"
+
+    resp = client.get("/jobs", params={"page_size": 100})
+    assert resp.json()["total"] == 20
+
+
+# 11. API unavailable ---------------------------------------------------------
+
+def test_client_request_to_unreachable_api_raises_connection_error():
+    """Documents expected client-side behavior (used by stress_test.py) when
+    the API process isn't up: a connection error, not a silent hang/crash."""
+    import requests
+
+    with pytest.raises(requests.exceptions.ConnectionError):
+        requests.get("http://127.0.0.1:1/jobs", timeout=1)
+
+
+# 12. Timeout/long-running job (no enforced timeout -- documented behavior) --
+
+def test_long_running_job_completes_without_being_killed(client, app_env, monkeypatch):
+    _main, worker = app_env
+    created = client.post("/jobs", json={"image_path": SAMPLE}).json()
+
+    real_compute_blur = worker.compute_blur
+
+    def slow_compute_blur(path):
+        time.sleep(0.2)  # stands in for a slow decode; worker enforces no timeout
+        return real_compute_blur(path)
+
+    monkeypatch.setattr(worker, "compute_blur", slow_compute_blur)
+    assert worker.process_once() is True
+
+    job = client.get(f"/jobs/{created['id']}").json()
+    assert job["status"] == "done"
+
+
+# 13. Empty IMAGE_DIR ----------------------------------------------------------
+
+def test_empty_image_dir_still_resolves_paths_without_crashing(app_env, tmp_path, monkeypatch):
+    """Point IMAGE_DIR at a directory with zero files. Path resolution
+    itself must not crash; the missing-file failure surfaces later, at
+    worker processing time (same as case 2)."""
+    import app.core.config as config
+    import app.services.job_service as job_service
+
+    empty_dir = tmp_path / "empty_images"
+    empty_dir.mkdir()
+    monkeypatch.setenv("IMAGE_DIR", str(empty_dir))
+    config.get_settings.cache_clear()
+
+    resolved = job_service.resolve_image_path("anything.png")
+    assert resolved == str(empty_dir / "anything.png")
+
+    config.get_settings.cache_clear()  # don't leak this override past the test
+
+
+# 14. Path traversal / security validation ------------------------------------
+
+def test_absolute_path_outside_image_dir_rejected(client):
+    resp = client.post("/jobs", json={"image_path": "/etc/passwd"})
+    assert resp.status_code == 400
+
+
+def test_path_traversal_via_multiple_dotdot_rejected(client):
+    resp = client.post("/jobs", json={"image_path": "subdir/../../../../etc/passwd"})
+    assert resp.status_code == 400
+
+
+def test_path_within_image_dir_subdirectory_is_allowed(client, app_env):
+    """Sanity check the traversal guard isn't overly strict: a real
+    subdirectory inside IMAGE_DIR should still be accepted."""
+    from app.core.config import get_settings
+
+    image_dir = get_settings().image_dir
+    subdir = os.path.join(image_dir, "nested")
+    os.makedirs(subdir, exist_ok=True)
+    nested_file = os.path.join(subdir, "nested_copy.png")
+    shutil.copy(os.path.join(image_dir, SAMPLE), nested_file)
+
+    try:
+        resp = client.post("/jobs", json={"image_path": "nested/nested_copy.png"})
+        assert resp.status_code == 201
+    finally:
+        os.remove(nested_file)
+        os.rmdir(subdir)
+
+
+
+================================================
+FILE: tests/test_worker.py
+================================================
+SHARP = "sharp_checkerboard.png"
+BLURRY = "blurry_checkerboard.png"
+MISSING = "no_such_file.png"  # valid relative path under IMAGE_DIR, file doesn't exist
+
+
+def test_worker_processes_job_end_to_end(client, app_env):
+    _main, worker = app_env
+
+    created = client.post("/jobs", json={"image_path": SHARP}).json()
+
+    did_work = worker.process_once()
+    assert did_work is True
+
+    job = client.get(f"/jobs/{created['id']}").json()
+    assert job["status"] == "done"
+    assert job["attempts"] == 1
+    assert job["result"]["is_blurry"] is False
+    assert job["result"]["sharpness_score"] > 100.0
+
+
+def test_worker_detects_blurry_image(client, app_env):
+    _main, worker = app_env
+
+    created = client.post("/jobs", json={"image_path": BLURRY}).json()
+    worker.process_once()
+
+    job = client.get(f"/jobs/{created['id']}").json()
+    assert job["status"] == "done"
+    assert job["attempts"] == 1
+    assert job["result"]["is_blurry"] is True
+
+
+def test_worker_marks_missing_file_failed_after_retries(client, app_env, monkeypatch):
+    _main, worker = app_env
+    monkeypatch.setattr(worker, "BACKOFF_BASE_SECONDS", 0)  # don't slow the test down
+
+    created = client.post("/jobs", json={"image_path": MISSING}).json()
+
+    # MAX_ATTEMPTS retries, then it should land on 'failed'.
+    for _ in range(worker.MAX_ATTEMPTS):
+        worker.process_once()
+
+    job = client.get(f"/jobs/{created['id']}").json()
+    assert job["status"] == "failed"
+    assert job["attempts"] == worker.MAX_ATTEMPTS
+    assert "error" in job["result"]
+
+
+def test_no_double_processing_when_queue_empty(client, app_env):
+    _main, worker = app_env
+    assert worker.process_once() is False
+
+
+def test_reclaim_stuck_job_after_timeout(client, app_env):
+    """A job left in 'processing' past STUCK_TIMEOUT_SECONDS (simulating a
+    worker that crashed mid-job) must be reclaimed and finished by the next
+    call to process_once(), which runs reclaim_stuck_jobs before claiming."""
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import text
+
+    _main, worker = app_env
+    created = client.post("/jobs", json={"image_path": SHARP}).json()
+
+    stuck_since = datetime.now(timezone.utc) - timedelta(seconds=worker.STUCK_TIMEOUT_SECONDS + 5)
+    with worker.engine.begin() as conn:
+        conn.execute(
+            text("UPDATE jobs SET status = 'processing', claimed_at = :claimed_at WHERE id = :id"),
+            {"claimed_at": stuck_since, "id": created["id"]},
+        )
+
+    job = client.get(f"/jobs/{created['id']}").json()
+    assert job["status"] == "processing"  # stuck, not yet reclaimed
+
+    did_work = worker.process_once()
+    assert did_work is True
+
+    job = client.get(f"/jobs/{created['id']}").json()
+    assert job["status"] == "done"
+
+
+
+================================================
+FILE: tools/generate_sample_images.py
+================================================
+"""Generates deterministic sample images used by tests/ and stress_test.py.
+
+Run once: python tools/generate_sample_images.py
+Re-running overwrites the files with byte-identical content (fixed seed,
+no randomness), so sharpness scores stay stable for assertions.
+"""
+
+import os
+
+import numpy as np
+from PIL import Image, ImageFilter
+
+OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "sample_images")
+
+
+def checkerboard(size=256, tile=16):
+    arr = np.zeros((size, size), dtype=np.uint8)
+    for y in range(0, size, tile):
+        for x in range(0, size, tile):
+            if ((x // tile) + (y // tile)) % 2 == 0:
+                arr[y : y + tile, x : x + tile] = 255
+    return Image.fromarray(arr, mode="L")
+
+
+def noise_image(size=256, seed=0):
+    rng = np.random.default_rng(seed)
+    arr = rng.integers(0, 256, size=(size, size), dtype=np.uint8)
+    return Image.fromarray(arr, mode="L")
+
+
+def stripes(size=256, width=4):
+    arr = np.zeros((size, size), dtype=np.uint8)
+    for x in range(0, size, width * 2):
+        arr[:, x : x + width] = 255
+    return Image.fromarray(arr, mode="L")
+
+
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    sharp_sources = {
+        "sharp_checkerboard.png": checkerboard(),
+        "sharp_noise.png": noise_image(seed=42),
+        "sharp_stripes.png": stripes(),
+    }
+    for name, img in sharp_sources.items():
+        img.convert("RGB").save(os.path.join(OUT_DIR, name))
+
+    # Blurry variants: heavy Gaussian blur collapses high-frequency edges,
+    # driving Laplacian variance well below BLUR_THRESHOLD (100.0).
+    for name, img in sharp_sources.items():
+        blurry_name = name.replace("sharp_", "blurry_")
+        blurred = img.filter(ImageFilter.GaussianBlur(radius=8))
+        blurred.convert("RGB").save(os.path.join(OUT_DIR, blurry_name))
+
+    # A flat/solid image: zero variance, unambiguously blurry.
+    flat = Image.new("L", (256, 256), color=128)
+    flat.convert("RGB").save(os.path.join(OUT_DIR, "blurry_flat.png"))
+
+    print(f"wrote {len(sharp_sources) * 2 + 1} images to {OUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+================================================
+FILE: .claude/settings.local.json
+================================================
+{
+  "enabledMcpjsonServers": [
+    "code-review-graph"
+  ]
+}
+
+

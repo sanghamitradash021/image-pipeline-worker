@@ -47,10 +47,15 @@ RECLAIM_STUCK_SQL = text(
     """
 )
 
-MARK_DONE_SQL = text("UPDATE jobs SET status = 'done', result = :result WHERE id = :id")
-MARK_FAILED_SQL = text("UPDATE jobs SET status = 'failed', result = :result WHERE id = :id")
+MARK_DONE_SQL = text(
+    "UPDATE jobs SET status = 'done', result = :result, updated_at = :now WHERE id = :id"
+)
+MARK_FAILED_SQL = text(
+    "UPDATE jobs SET status = 'failed', result = :result, updated_at = :now WHERE id = :id"
+)
 MARK_RETRY_SQL = text(
-    "UPDATE jobs SET status = 'pending', result = :result, run_at = :run_at WHERE id = :id"
+    "UPDATE jobs SET status = 'pending', result = :result, run_at = :run_at, "
+    "updated_at = :now WHERE id = :id"
 )
 
 
@@ -61,22 +66,22 @@ class JobRepository:
         self.session = session
 
     def create(self, image_path: str, run_at: Optional[datetime] = None) -> Job:
-        job = Job(image_path=image_path, status="pending", run_at=run_at)
+        job = Job(image_path=image_path, status="pending", run_at=run_at)  # type: ignore[call-arg]
         self.session.add(job)
         self.session.commit()
         self.session.refresh(job)
         return job
 
     def get_by_id(self, job_id: str) -> Optional[Job]:
-        return self.session.get(Job, job_id)
+        return self.session.get(Job, job_id)  # type: ignore[return-value]
 
     def list(self, status: Optional[str], page: int, page_size: int) -> tuple[int, list[Job]]:
-        query = self.session.query(Job)
+        query = self.session.query(Job)  # type: ignore[var-annotated]
         if status:
-            query = query.filter(Job.status == status)
+            query = query.filter(Job.status == status)  # type: ignore[var-annotated]
         total = query.count()
         items = (
-            query.order_by(Job.created_at)
+            query.order_by(Job.created_at)  # type: ignore[var-annotated]
             .offset((page - 1) * page_size)
             .limit(page_size)
             .all()
@@ -99,12 +104,18 @@ class QueueRepository:
 
     @staticmethod
     def mark_done(conn, job_id: str, result_json: str) -> None:
-        conn.execute(MARK_DONE_SQL, {"result": result_json, "id": job_id})
+        now = datetime.now(timezone.utc)
+        conn.execute(MARK_DONE_SQL, {"result": result_json, "now": now, "id": job_id})
 
     @staticmethod
     def mark_failed(conn, job_id: str, result_json: str) -> None:
-        conn.execute(MARK_FAILED_SQL, {"result": result_json, "id": job_id})
+        now = datetime.now(timezone.utc)
+        conn.execute(MARK_FAILED_SQL, {"result": result_json, "now": now, "id": job_id})
 
     @staticmethod
     def mark_retry(conn, job_id: str, result_json: str, run_at: datetime) -> None:
-        conn.execute(MARK_RETRY_SQL, {"result": result_json, "run_at": run_at, "id": job_id})
+        now = datetime.now(timezone.utc)
+        conn.execute(
+            MARK_RETRY_SQL,
+            {"result": result_json, "run_at": run_at, "now": now, "id": job_id},
+        )

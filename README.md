@@ -4,6 +4,39 @@ FastAPI + SQLite(/Postgres via SQLAlchemy) job queue with parallel worker
 processes, guaranteeing exactly-once processing. See `DESIGN.md` for how,
 and for the repository/service/controller layering.
 
+## How it works
+
+```mermaid
+flowchart LR
+    Client(["Client"])
+    API["FastAPI\napp/main.py"]
+    Svc["JobService\n(business logic)"]
+    Repo["JobRepository\n(ORM CRUD)"]
+    Queue[("jobs table = QUEUE\npending -> processing -> done/failed")]
+    QRepo["QueueRepository\n(atomic claim/mark,\none txn each)"]
+    W1["worker #1"]
+    W2["worker #2"]
+    W3["worker #N"]
+    Blur["BlurService\nOpenCV Laplacian variance"]
+    Img[("IMAGE_DIR")]
+
+    Client -- "POST /jobs\nGET /jobs/{id}" --> API
+    API --> Svc --> Repo --> Queue
+    Queue <--> QRepo
+    QRepo -- "claim_next_job\n(UPDATE...RETURNING)" --> W1
+    QRepo --> W2
+    QRepo --> W3
+    W1 --> Blur
+    W2 --> Blur
+    W3 --> Blur
+    Blur -- reads --> Img
+    Blur -- "mark_done/mark_failed/mark_retry" --> QRepo
+```
+
+Any number of `app.worker` processes can run against the same DB/queue at
+once — the atomic claim UPDATE guarantees each job is picked up by exactly
+one of them (see "Exactly-once processing" in `DESIGN.md`).
+
 ## Setup
 
 ```bash

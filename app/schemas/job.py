@@ -16,6 +16,7 @@ class JobOut(BaseModel):
     attempts: int
     created_at: datetime
     updated_at: datetime
+    claimed_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
 

@@ -2,6 +2,8 @@
 
 ## Architecture
 
+![Architecture overview](c83ab891-5d4f-4646-8971-584720a156ee.png)
+
 ```
 app/api/routes/jobs.py   controller: HTTP request/response only, no logic
         |
@@ -89,6 +91,17 @@ reflects "how many times a worker has picked this job up," independent of
 whether processing then succeeds or fails. For a job that succeeds on its
 first pickup, `attempts == 1`, which is what the stress test asserts.
 
+`JobOut` (`app/schemas/job.py`) also exposes `claimed_at` (when a worker
+picked the job up) alongside `created_at`/`updated_at`, so a caller can see
+queue-wait and processing-window timing without querying the DB directly.
+
+Negative/edge-case coverage (invalid/missing/corrupted `image_path`,
+unknown job id, worker exception, worker crash mid-job, concurrent claim
+race, retry/max-attempts, stuck-job reclaim timing, DB write concurrency,
+unreachable API, long-running job, empty `IMAGE_DIR`, path traversal) lives
+in `tests/test_edge_cases.py`, separate from `tests/test_api.py` and
+`tests/test_worker.py`'s happy-path/core-mechanism tests.
+
 ## Bonus features implemented
 
 - **Retries with exponential backoff**: on failure, if `attempts <
@@ -101,6 +114,11 @@ first pickup, `attempts == 1`, which is what the stress test asserts.
   forever. (`QueueRepository.reclaim_stuck_jobs` in
   `app/repositories/job_repository.py`, covered by
   `tests/test_worker.py::test_reclaim_stuck_job_after_timeout`)
+
+  ![Crash recovery scenarios](crash-recovery.png)
+
+  Scenario 6 in the diagram (heartbeat) is a **future improvement, not
+  implemented** — see the limitation below.
 
   **Known limitation**: this treats "stuck in `processing` for
   `STUCK_TIMEOUT_SECONDS`" as a proxy for "the worker crashed" — there's no

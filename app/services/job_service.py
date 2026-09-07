@@ -51,4 +51,5 @@ class JobService:
             attempts=job.attempts,
             created_at=job.created_at,
             updated_at=job.updated_at,
+            claimed_at=job.claimed_at,
         )
